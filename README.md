@@ -15,6 +15,8 @@
 
 This guide implements resource-level exclusions while retaining Defender for Servers Plan 2 as the subscription-wide default. A Microsoft built-in Azure Policy uses a resource tag to [disable Defender for Servers](https://learn.microsoft.com/en-us/azure/defender-for-cloud/tutorial-enable-servers-plan#disable-the-plan-using-azure-policy-for-resource-tag) on confirmed VDI resources by deploying `pricingTier: Free`. Untagged servers continue to inherit Plan 2. The guide covers the required subscription setting, policy assignment, remediation, validation, and rollback. Plan 1 is not used.
 
+The Microsoft Learn instructions are incomplete and difficult to follow. They identify the policy but leave out several details needed to implement it safely, verify that it worked, and reverse it correctly. This guide provides the complete procedure.
+
 Use this Microsoft built-in policy:
 
 > [**Configure Azure Defender for Servers to be disabled for resources (resource level) with the selected tag**](https://learn.microsoft.com/en-us/azure/governance/policy/samples/built-in-policies#security-center---granular-pricing)
@@ -196,14 +198,65 @@ Use a non-production resource group with one representative tagged VDI machine a
 
     ![Azure Policy assignment using a system-assigned managed identity with Security Admin permissions](images/policy-assignment-managed-identity.png)
 
-7. **Verify the exclusion.** After selecting **Create** in step 6, wait for policy evaluation and background remediation. No additional action is required to start the remediation task selected in step 5.
+7. **Verify the exclusion.** After selecting **Create** in step 6, wait for policy evaluation and background remediation. A new assignment can take several minutes to begin evaluation, and remediation completion time depends on the scope and current service load. No additional action is required to start the remediation task selected in step 5.
 
     **Optional monitoring:** You can check **Policy** > **Remediation** > **Remediation tasks** for progress, but this is not required for validation. The task might not appear immediately while Azure evaluates the new assignment. An empty task list during this period does not mean the assignment failed, and you should not create a second remediation task.
 
-    Run the following check once for the tagged VDI and again for the untagged control server. For each resource, copy the complete **Resource ID** from its **Properties** page in the Azure portal and paste it below.
+    Resource-level Defender for Servers pricing supports:
+
+    - Azure virtual machines
+    - Azure Virtual Machine Scale Sets
+    - Azure Arc-enabled servers
+
+    This VDI scenario will normally use an Azure VM or VM scale set.
+
+    Run the PowerShell check twice:
+
+    - Once using the tagged VDI resource ID
+    - Once using the untagged control-server resource ID
+
+    For each resource, copy the complete **Resource ID** from its **Properties** page in the Azure portal and paste it into `$machineResourceId`. Do not construct the resource ID manually.
+
+   | Resource type | Resource ID format |
+   | --- | --- |
+   | Azure VM | `/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name>` |
+   | VM scale set | `/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachineScaleSets/<vmss-name>` |
+   | Azure Arc-enabled server | `/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.HybridCompute/machines/<server-name>` |
+
+    `VirtualMachines` in `$machineResourceId/providers/Microsoft.Security/pricings/VirtualMachines` is the Defender for Servers pricing-plan name. It remains `VirtualMachines` for Azure VMs, VM scale sets, and Arc-enabled servers.
+
+    Before running the script, replace all three placeholders:
+
+    - `$tenantId`: Microsoft Entra tenant ID
+    - `$subscriptionId`: Azure subscription ID containing the machine
+    - `$machineResourceId`: Complete resource ID copied from the machine's **Properties** page
 
    ```powershell
-   $machineResourceId = '<paste-resource-id-here>'
+   [guid]$tenantId            = '<tenant-id>'
+   [guid]$subscriptionId      = '<subscription-id>'
+   [string]$machineResourceId = '<paste-complete-resource-id-here>'
+
+   if ($machineResourceId -notlike "/subscriptions/$subscriptionId/*") {
+       throw 'The machine Resource ID is invalid or belongs to another subscription.'
+   }
+
+   Connect-AzAccount `
+       -Tenant $tenantId `
+       -Subscription $subscriptionId `
+       -Scope Process `
+       -ErrorAction Stop
+
+   $context = Get-AzContext
+
+   if (
+       $null -eq $context -or
+       $context.Tenant.Id -ne $tenantId.ToString() -or
+       $context.Subscription.Id -ne $subscriptionId.ToString()
+   ) {
+       throw 'Azure connected to an unexpected tenant or subscription.'
+   }
+
+   "Connected: $($context.Account.Id) -> $($context.Subscription.Name) [$($context.Subscription.Id)]"
 
    $resourcePricingPath = (
        "$machineResourceId/providers/Microsoft.Security/" +
@@ -212,7 +265,9 @@ Use a non-production resource group with one representative tagged VDI machine a
 
    $response = Invoke-AzRestMethod `
        -Method GET `
-       -Path $resourcePricingPath
+       -Path $resourcePricingPath `
+       -DefaultProfile $context `
+       -ErrorAction Stop
 
    if ($response.StatusCode -ne 200) {
        throw "Unable to read resource pricing. HTTP status: $($response.StatusCode)"
@@ -224,23 +279,24 @@ Use a non-production resource group with one representative tagged VDI machine a
 
    Compare each result with the expected values:
 
-   | Resource checked | `pricingTier` | `subPlan` | `inherited` |
-   | --- | --- | --- | --- |
-   | Tagged VDI | `Free` | Blank | `False` |
-   | Untagged control server | `Standard` | `P2` | `True` |
+    | Resource checked | Expected result |
+    | --- | --- |
+    | Tagged VDI | `pricingTier=Free` and `inherited=False` |
+    | Untagged control server | Continues inheriting subscription Plan 2 |
 
-   These are Defender for Servers pricing properties, not resource tags. The tagged VDI result confirms that Defender for Servers is disabled at resource scope. The control result confirms that an untagged resource still inherits Plan 2 from the subscription. Review both machines in the Defender for Cloud [Coverage workbook](https://learn.microsoft.com/en-us/azure/defender-for-cloud/custom-dashboards-azure-workbooks) as the visual proof of coverage state.
+    The command displays `subPlan` for reference, but no `subPlan` value is required for the tagged `Free` resource. Use `pricingTier=Free` and `inherited=False` to validate the exclusion. These are Defender for Servers pricing properties, not resource tags.
 
-   **Technical note:** A new assignment can take several minutes to begin evaluation, and remediation completion time depends on the scope and current service load. The pricing child resource is named `VirtualMachines` for all three supported resource types; only the parent provider segment in the copied Resource ID changes.
+    ![PowerShell output showing resource pricing set to Free and inheritance disabled](images/resource-pricing-free-not-inherited.png)
 
-   | Resource type | Expected parent provider segment |
-   | --- | --- |
-   | Azure VM | `Microsoft.Compute/virtualMachines/<name>` |
-   | VM scale set | `Microsoft.Compute/virtualMachineScaleSets/<name>` |
-   | Azure Arc-enabled server | `Microsoft.HybridCompute/machines/<name>` |
+    For the untagged control server, `pricingTier=Standard`, `subPlan=P2`, and `inherited=True` confirm that it still inherits Defender for Servers Plan 2 from the subscription.
+
+    ![PowerShell output showing inherited Defender for Servers Plan 2 pricing](images/resource-pricing-p2-inherited.png)
+
+    Open **Microsoft Defender for Cloud** > **Workbooks** > **Coverage**. This is a built-in workbook and does not require installation. Use it as supplemental visual confirmation for both machines.
 8. Confirm endpoint protection remains healthy. Record which Defender for Endpoint and monitoring extensions remain installed, and verify the expected device state in the Microsoft Defender portal.
 9. After configuring production tag automation, provision or replace a third VDI. Confirm the selected mechanism applies the tag and that the machine reaches compliance without manual tagging.
-10. Remove the tag from a test VDI and confirm the `Free` resource-level object persists. Reapply the tag before completing the pilot.
+
+> **Rollback note:** Removing the tag or policy assignment does not restore Defender for Servers Plan 2. The resource-level `Free` configuration remains until it is explicitly deleted. Follow the [Rollback](#rollback) procedure to restore subscription-level Plan 2 inheritance.
 
 Roll out one resource group at a time after security owners approve the pilot.
 
@@ -262,6 +318,8 @@ Record billing confirmation as a scheduled follow-up. In Cost Management, filter
 | The tag is applied, but compliance state and pricing are unchanged | Evaluation is not immediate. New or updated resources are typically reflected around 15 minutes later; standard reevaluation runs every 24 hours. | Trigger an on-demand compliance scan, then rerun the resource-scope GET. |
 | Remediation fails and the resource still inherits Plan 2 | Subscription pricing `enforce` is `True`, which prevents descendants from overriding the subscription configuration. | Rerun the subscription GET; set `enforce` to `False` with security-owner approval. |
 | The PUT returns 200, but a Plan 2 extension is not in its expected state | The API can update the pricing object while an individual extension reports failure. | Inspect the extension's `operationStatus.code` and `operationStatus.message`, correct the underlying failure, and rerun the GET. |
+| Resource pricing GET returns `401` | The Az PowerShell session is not authenticated, or its token is stale. | Run the complete Step 7 block, including `Connect-AzAccount`, in the same terminal. |
+| Resource pricing GET returns `400` | The resource ID is malformed or still contains a placeholder. | Copy the complete Resource ID from the resource's **Properties** page and rerun the complete Step 7 block. |
 
 Add lab-observed failure modes only after recording the actual error text and validating the resolution.
 
