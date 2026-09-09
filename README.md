@@ -46,6 +46,8 @@ Record the resource IDs, current Defender for Endpoint state, and installed exte
 
 The resource-level exclusion is a standing security exception, with `DefenderForServers=VDI-Disabled` serving as its control signal. Manual tagging is acceptable for the pilot. Before production rollout, configure the VDI provisioning process or a narrowly scoped Azure Policy to apply the tag automatically to approved VDI hosts. Document who approves which host groups qualify, who owns the tagging configuration, and how the tagged resources are periodically reconciled against the approved VDI inventory. Azure Resource Graph can enumerate every resource carrying the tag for this reconciliation.
 
+Apply the tag only to the VM, VM scale set, or Arc-enabled server being excluded. The [built-in policy](https://github.com/Azure/azure-policy/blob/master/built-in-policies/policyDefinitions/Security%20Center%20-%20Granular%20Pricing/ASC_Azure_Defender_Servers_Disable_ResourceLevel_ByTag_DINE.json) does not evaluate disks, NICs, or NSGs, so applying the tag to those resources has no effect. Keeping the tag on the resource it governs avoids ambiguity and makes the exception easier to audit.
+
 ## Implementation walkthrough
 
 Use this table as the implementation sequence. The [detailed implementation reference](#detailed-implementation-reference) below contains the portal steps and verification commands.
@@ -53,7 +55,7 @@ Use this table as the implementation sequence. The [detailed implementation refe
 | Stage | Action | Continue when |
 | --- | --- | --- |
 | 1 | Read subscription pricing | The result is `Standard`, `P2`, and `enforce=False` or unset |
-| 2 | Tag one pilot VDI | `DefenderForServers=VDI-Disabled` exists directly on the VM or VMSS |
+| 2 | Tag one pilot VDI | `DefenderForServers=VDI-Disabled` exists directly on the VM, VMSS, or Arc-enabled server |
 | 3 | Assign the built-in policy | The assignment's managed identity has **Security Admin** at the assignment scope |
 | 4 | Create remediation | Remediation completes successfully |
 | 5 | Check the tagged VDI | Resource pricing is `Free` and `inherited=False` |
@@ -177,7 +179,7 @@ Use a non-production resource group with one representative tagged VDI machine a
 
    Changing `enforce` to `False` does not disable Plan 2. It keeps Plan 2 as the subscription default while allowing explicit resource-level exceptions; untagged resources continue inheriting Plan 2. Run Step 1A again and verify `Standard`, `P2`, and `False`. A 200 or 201 response can include partial extension failures, so inspect each extension's `operationStatus` from the follow-up `GET` and confirm that all configured Plan 2 extensions remain in their intended state.
 
-2. Open the representative VDI resource in the Azure portal, select **Tags**, and add this tag directly to the VM or VM scale set:
+2. Open the representative VDI resource in the Azure portal, select **Tags**, and add this tag directly to the VM, VM scale set, or Arc-enabled server:
 
     | Azure tag field | Enter this value |
     | --- | --- |
